@@ -1,0 +1,98 @@
+import cv2
+import rclpy
+
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
+
+
+# Each printed marker ID identifies a physical corner of the keyboard.
+CORNER_BY_ID = {
+    1: "top left",
+    4: "top right",
+    2: "bottom left",
+    3: "bottom right",
+}
+
+
+class KeyboardDetector(Node):
+    def __init__(self):
+        super().__init__("keyboard_detector")
+
+        self.declare_parameter("image_topic", "/camera/color/image_raw")
+        image_topic = self.get_parameter("image_topic").value
+
+        self.bridge = CvBridge()
+        self.dictionary = cv2.aruco.getPredefinedDictionary(
+            cv2.aruco.DICT_4X4_50
+        )
+
+        # OpenCV versions use one of two marker detection APIs.
+        self.detector = None
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            self.detector = cv2.aruco.ArucoDetector(self.dictionary)
+
+        self.image_sub = self.create_subscription(
+            Image, image_topic, self.image_callback, qos_profile_sensor_data
+        )
+        self.debug_pub = self.create_publisher(
+            Image, "/keyboard/debug_image", 10
+        )
+        self.previous_visible = None
+
+    def image_callback(self, msg):
+        # Convert the ROS image into an image OpenCV can process.
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.detector is not None:
+            corners, ids, _ = self.detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary)
+
+        # Store the four pixel corners of each recognized keyboard marker.
+        visible = {}
+
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
+            for marker_id, marker_corners in zip(ids.flatten(), corners):
+                marker_id = int(marker_id)
+                if marker_id in CORNER_BY_ID:
+                    visible[marker_id] = marker_corners.reshape(4, 2)
+
+        # Report changes so the terminal doesn't print the same thing every frame.
+        visible_ids = set(visible)
+        if visible_ids != self.previous_visible:
+            missing = [
+                name for marker_id, name in CORNER_BY_ID.items()
+                if marker_id not in visible_ids
+            ]
+            if missing:
+                self.get_logger().info(f"Missing corners: {', '.join(missing)}")
+            else:
+                self.get_logger().info("All four keyboard markers detected")
+
+            self.previous_visible = visible_ids
+
+        # Publish every frame, including frames where no markers were found.
+        debug_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+        debug_msg.header = msg.header
+        self.debug_pub.publish(debug_msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = KeyboardDetector()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()
